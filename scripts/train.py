@@ -6,29 +6,33 @@ import logging
 import random as py_random
 from datetime import datetime
 
+import numpy as np
+
 import jax
 from jax import random
 from jax import numpy as jnp
 
 import flax
-from flax.training import checkpoints
-from flax.training.train_state import TrainState
+from flax.training import checkpoints, train_state
 
 import optax
 
 import torch
 from torchvision import transforms
-from torchvision.datasets import CIFAR10
+from torchvision.datasets import CIFAR10, CIFAR100, ImageNet
 from torch.utils.data import DataLoader
 
-from nxcl.logging import RichHandler, RichFileHandler
+from nxcl.rich.logging import RichHandler, RichFileHandler
+from nxcl.rich.progress import Progress
 
-from lib.nets.cnn_v1 import CNN_V1
+from models.cnn import CNN
+from models.resnet import ResNet18, ResNet34, ResNet50, ResNet101, ResNet152, ResNet200
 
 
-def compute_cross_entropy(*, logits, labels):
-    one_hot_labels = jax.nn.one_hot(labels, num_classes=10)
-    cross_entropy = -jnp.mean(jnp.sum(one_hot_labels * logits, axis=-1))
+def compute_cross_entropy(*, logits, labels, num_classes):
+    one_hot_labels = jax.nn.one_hot(labels, num_classes=num_classes)
+    log_prob = jax.nn.log_softmax(logits, axis=-1)
+    cross_entropy = -jnp.mean(jnp.sum(one_hot_labels * log_prob, axis=-1))
     return cross_entropy
 
 
@@ -37,64 +41,99 @@ def compute_accuracy(*, logits, labels):
     return accuracy
 
 
-def get_train_step(model):
+def get_train_step(model, use_batch_stats=False):
     @jax.jit
     def train_step(state, rngs, *, images, labels):
         def loss_fn(params):
-            logits = model.apply(params, images, rngs=rngs)
-            loss = compute_cross_entropy(logits=logits, labels=labels)
+            var = dict(params=params, batch_stats=state.batch_stats) if use_batch_stats else dict(params=params)
+            outputs = state.apply_fn(var, images, rngs=rngs, train=True, mutable=(["batch_stats"] if use_batch_stats else False))
+            if use_batch_stats:
+                logits, new_state = outputs
+            else:
+                logits = outputs
+            loss = compute_cross_entropy(logits=logits, labels=labels, num_classes=model.num_classes)
             accuracy = compute_accuracy(logits=logits, labels=labels)
-            return loss, accuracy
+            return loss, (accuracy, (new_state if use_batch_stats else None))
+
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (loss, accuracy), grads = grad_fn(state.params)
-        state = state.apply_gradients(grads=grads)
+        (loss, (accuracy, new_state)), grads = grad_fn(state.params)
+
+        if use_batch_stats:
+            state = state.apply_gradients(grads=grads, batch_stats=new_state["batch_stats"])
+        else:
+            state = state.apply_gradients(grads=grads)
         return state, dict(loss=loss, accuracy=accuracy)
     return train_step
 
 
-def get_valid_step(model):
+def get_valid_step(model, use_batch_stats=False):
     @jax.jit
     def valid_step(state, rngs, *, images, labels):
-        logits = model.apply(state.params, images, rngs=rngs)
-        loss = compute_cross_entropy(logits=logits, labels=labels)
+        var = dict(params=state.params, batch_stats=state.batch_stats) if use_batch_stats else dict(params=state.params)
+        logits = state.apply_fn(var, images, rngs=rngs, train=False, mutable=False)
+        loss = compute_cross_entropy(logits=logits, labels=labels, num_classes=model.num_classes)
         accuracy = compute_accuracy(logits=logits, labels=labels)
         return dict(loss=loss, accuracy=accuracy)
     return valid_step
 
 
-# def collate_fn(batch: torch.Tensor) -> jax.numpy.array:
-#     images = jnp.asarray(torch.cat([image.unsqueeze(dim=0) for image, _ in batch], dim=0).numpy())
-#     labels = jnp.asarray([label for _, label in batch])
-#     return images, labels
+def numpy_collate(batch):
+  if isinstance(batch[0], np.ndarray):
+    return np.stack(batch)
+  elif isinstance(batch[0], (tuple, list)):
+    transposed = zip(*batch)
+    return [numpy_collate(samples) for samples in transposed]
+  else:
+    return np.array(batch)
 
 
-def get_train_loader(batch_size: int):
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-        lambda x: x.permute(1, 2, 0),
-    ])
-    train_dataset = CIFAR10(root='./data', train=True, download=False, transform=train_transform)
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=4, #collate_fn=collate_fn,
-    )
+def get_train_loader(dataset: str, batch_size: int):
+    if dataset == "cifar10" or dataset == "cifar100":
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            lambda x: x.permute(1, 2, 0).numpy(),
+        ])
+        CIFAR = CIFAR10 if dataset == "cifar10" else CIFAR100
+        train_dataset = CIFAR(root="~/datasets", train=True, download=False, transform=train_transform)
+    elif dataset == "imagenet":
+        train_transform = transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            lambda x: x.permute(1, 2, 0).numpy(),
+        ])
+        train_dataset = ImageNet(root="~/datasets/ILSVRC2012", split="train", transform=train_transform)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}")
+    train_loader = DataLoader(train_dataset, batch_size, shuffle=True, num_workers=4, collate_fn=numpy_collate)
     return train_loader
 
 
-def get_valid_loader(batch_size: int):
-    valid_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-        lambda x: x.permute(1, 2, 0),
-    ])
-    valid_dataset = CIFAR10(root='./data', train=False, download=False, transform=valid_transform)
-    valid_loader = DataLoader(
-        valid_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=4, #collate_fn=collate_fn,
-    )
+def get_valid_loader(dataset: str, batch_size: int):
+    if dataset == "cifar10" or dataset == "cifar100":
+        valid_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            lambda x: x.permute(1, 2, 0).numpy(),
+        ])
+        CIFAR = CIFAR10 if dataset == "cifar10" else CIFAR100
+        valid_dataset = CIFAR(root="~/datasets", train=False, download=False, transform=valid_transform)
+    elif dataset == "imagenet":
+        valid_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            lambda x: x.permute(1, 2, 0).numpy(),
+        ])
+        valid_dataset = ImageNet(root="~/datasets/ILSVRC2012", split="val", transform=valid_transform)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}")
+    valid_loader = DataLoader(valid_dataset, batch_size, shuffle=False, num_workers=4, collate_fn=numpy_collate)
     return valid_loader
 
 
@@ -105,66 +144,86 @@ def main(args, output_dir):
     rngs = dict(params=key, dropout=key)
 
     # Create model
-    if args.model == "cnn_v1":
-        model = CNN_V1()
-    else:
+    models = {
+        "cnn": CNN,
+        "resnet18":  ResNet18,
+        "resnet34":  ResNet34,
+        "resnet50":  ResNet50,
+        "resnet101": ResNet101,
+        "resnet152": ResNet152,
+        "resnet200": ResNet200,
+    }
+
+    if args.model not in models:
         raise ValueError(f"Unknown model: {args.model}")
 
+    num_classes = 10 if args.dataset == "cifar10" else 100 if args.dataset == "cifar100" else 1000
+    model = models[args.model](num_classes=num_classes)
+
+    if args.dataset == "cifar10" or args.dataset == "cifar100":
+        dummy_input = jnp.ones((4, 32, 32, 3))
+    elif args.dataset == "imagenet":
+        dummy_input = jnp.ones((4, 224, 224, 3))
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+    w = model.init(rngs, dummy_input)
+
     # Initialize model and optimizer
-    dummy_cifar10 = jnp.ones((4, 32, 32, 3))
-    params = model.init(rngs, dummy_cifar10)
-    # tx = optax.adam(learning_rate=args.learning_rate)
-    tx = optax.sgd(learning_rate=args.learning_rate)
-    state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    if args.optimizer == "adam":
+        tx = optax.adam(learning_rate=args.learning_rate)
+    elif args.optimizer == "sgd":
+        tx = optax.sgd(learning_rate=args.learning_rate)
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optimizer}")
+
+    if "batch_stats" in w:
+        use_batch_stats = True
+        class TrainState(train_state.TrainState):
+            batch_stats: jnp.DeviceArray = None
+        state = TrainState.create(apply_fn=model.apply, tx=tx, params=w["params"], batch_stats=w["batch_stats"])
+    else:
+        use_batch_stats = False
+        class TrainState(train_state.TrainState):
+            pass
+        state = TrainState.create(apply_fn=model.apply, tx=tx, params=w["params"])
 
     # Setup output directory
-    exp_dir = os.path.join("outs", args.model, os.path.basename(output_dir))
+    exp_dir = os.path.join("outs", args.dataset, args.model, os.path.basename(output_dir))
     os.makedirs(os.path.dirname(exp_dir), exist_ok=True)
-    os.symlink(os.path.join("..", "_", os.path.basename(output_dir)), exp_dir)
+    os.symlink(os.path.join("..", "..", "_", os.path.basename(output_dir)), exp_dir)
 
     # Setup steps
-    train_step = get_train_step(model)
-    valid_step = get_valid_step(model)
+    train_step = get_train_step(model, use_batch_stats=use_batch_stats)
+    valid_step = get_valid_step(model, use_batch_stats=use_batch_stats)
 
-    train_loader = get_train_loader(args.batch_size)
-    valid_loader = get_valid_loader(args.batch_size)
+    train_loader = get_train_loader(args.dataset, args.batch_size)
+    valid_loader = get_valid_loader(args.dataset, args.batch_size)
 
     train_meter = AverageMeter("loss", "accuracy")
     valid_meter = AverageMeter("loss", "accuracy")
 
     # Train
-    with Progress() as progress:
-        epoch_task = progress.add_task("Epoch", total=args.num_epochs)
+    with Progress() as p:
+        for i in p.trange(1, args.num_epochs + 1, description="Epoch"):
 
-        for i in range(1, args.num_epochs + 1):
-            progress.advance(epoch_task)
-            key, model_key = random.split(key)
-
-            train_task = progress.add_task("Train", total=len(train_loader))
             train_meter.reset()
-            for images, labels in train_loader:
-                images, labels = jnp.asarray(images.numpy()), jnp.asarray(labels.numpy())
-                progress.advance(train_task)
-                state, train_metric = train_step(state, dict(dropout=model_key), images=images, labels=labels)
+            for images, labels in p.track(train_loader, description="Train", remove=True):
+                key, model_key = random.split(key)
+                rngs = dict(dropout=model_key)
+                state, train_metric = train_step(state, rngs, images=images, labels=labels)
                 train_meter.update(train_metric, n=len(images))
-            progress.remove_task(train_task)
 
-            valid_task = progress.add_task("Valid", total=len(valid_loader))
             valid_meter.reset()
-            for images, labels in valid_loader:
-                images, labels = jnp.asarray(images.numpy()), jnp.asarray(labels.numpy())
-                progress.advance(valid_task)
-                valid_metric = valid_step(state, dict(dropout=model_key), images=images, labels=labels)
+            for images, labels in p.track(valid_loader, description="Valid", remove=True):
+                key, model_key = random.split(key)
+                rngs = dict(dropout=model_key)
+                valid_metric = valid_step(state, rngs, images=images, labels=labels)
                 valid_meter.update(valid_metric, n=len(images))
-            progress.remove_task(valid_task)
-
-            train_metric = train_meter.value
-            valid_metric = valid_meter.value
 
             logger.info(
                 f"Epoch {i:3d} / {args.num_epochs} | "
-                f"Train Loss: {train_metric['loss']:7.4f}  Acc: {train_metric['accuracy']:6.2f} | "
-                f"Valid Loss: {valid_metric['loss']:7.4f}  Acc: {valid_metric['accuracy']:6.2f}"
+                f"Train Loss: {train_meter.loss:7.4f}  Acc: {train_meter.accuracy:6.2f} | "
+                f"Valid Loss: {train_meter.loss:7.4f}  Acc: {train_meter.accuracy:6.2f}"
             )
 
             if i % args.save_every == 0:
@@ -186,8 +245,8 @@ def setup_logger(logger_name: str, output_dir: str):
     LOG_DATE_SHORT_FORMAT = "%H:%M:%S"
     LOG_DATE_LONG_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-    logging.getLogger().addHandler(logging.NullHandler())
     logger = logging.getLogger(logger_name)
+    logger.propagate = False
     logger.setLevel(logging.DEBUG)
 
     stream_handler = RichHandler(tracebacks_suppress=[jax, flax, torch])
@@ -208,51 +267,57 @@ def setup_logger(logger_name: str, output_dir: str):
     return logger
 
 
-def Progress(*args, **kwargs):
-    from rich import progress
-    return progress.Progress(
-        "[progress.description]{task.description}",
-        progress.BarColumn(),
-        "[progress.percentage]{task.percentage:>3.0f}%",
-        progress.TimeElapsedColumn(),
-        progress.TimeRemainingColumn(),
-        progress.SpinnerColumn(),
-        *args,
-        **kwargs,
-    )
-
-
 class AverageMeter:
-    def __init__(self, *args):
-        self.names = args
-        self.sums = {k: 0 for k in args}
-        self.cnts = {k: 0 for k in args}
+    def __init__(self, *names):
+        self.names = names
+        self.sums = {k: 0 for k in names}
+        self.cnts = {k: 0 for k in names}
 
     def reset(self):
         self.sums = {k: 0 for k in self.names}
         self.cnts = {k: 0 for k in self.names}
 
-    def update(self, values: dict, n: int = 1):
-        for k in self.names:
-            self.sums[k] += values[k] * n
+    # def update(self, values: Optional[dict] = None, n: int = 1, **kwargs):
+    def update(self, values: dict = None, n: int = 1, **kwargs):
+        if values is None:
+            values = kwargs
+        else:
+            values = {**values, **kwargs}
+
+        for k, v in values.items():
+            self.sums[k] += v * n
             self.cnts[k] += n
 
     @property
     def value(self):
         return {k: self.sums[k] / self.cnts[k] for k in self.names}
 
+    def __getattr__(self, name):
+        if name in self.names:
+            return self.sums[name] / self.cnts[name]
+        else:
+            raise AttributeError(f"{name} is not recorded metric")
+
+    def __getitem__(self, name):
+        if name in self.names:
+            return self.sums[name] / self.cnts[name]
+        else:
+            raise KeyError(f"{name} is not recorded metric")
+
 
 if __name__ == "__main__":
     from argparse import ArgumentParser
 
     parser = ArgumentParser()
-    parser.add_argument("-m", "--model",   type=str,   required=True)
-    parser.add_argument("-s", "--seed",    type=int,   default=0)
-    parser.add_argument("--num-epochs",    type=int,   default=100)
-    parser.add_argument("--batch-size",    type=int,   default=512)
-    parser.add_argument("--learning-rate", type=float, default=0.1)
-    parser.add_argument("--valid-every",   type=int,   default=100)
-    parser.add_argument("--save-every",    type=int,   default=10)
+    parser.add_argument("-m",   "--model",         type=str,   default="cnn")
+    parser.add_argument("-d",   "--dataset",       type=str,   default="cifar10")
+    parser.add_argument("-opt", "--optimizer",     type=str,   default="sgd")
+    parser.add_argument("-e",   "--num-epochs",    type=int,   default=100)
+    parser.add_argument("-bs",  "--batch-size",    type=int,   default=512)
+    parser.add_argument("-lr",  "--learning-rate", type=float, default=0.1)
+    parser.add_argument("-s",   "--seed",          type=int,   default=0)
+    parser.add_argument("--valid-every",           type=int,   default=100)
+    parser.add_argument("--save-every",            type=int,   default=10)
     args = parser.parse_args()
 
     # Logger
