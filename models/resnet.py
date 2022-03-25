@@ -81,14 +81,13 @@ class ResNet(nn.Module):
     block_cls: ModuleDef
     num_classes: int
     num_filters: int = 64
-    dtype: Any = jnp.float32
     act: Callable = nn.relu
     conv: ModuleDef = nn.Conv
 
     @nn.compact
     def __call__(self, x, train: bool = True):
-        conv = partial(self.conv, use_bias=False, dtype=self.dtype)
-        norm = partial(nn.BatchNorm, use_running_average=not train, momentum=0.9, epsilon=1e-5, dtype=self.dtype)
+        conv = partial(self.conv, use_bias=False)
+        norm = partial(nn.BatchNorm, use_running_average=not train, momentum=0.9, epsilon=1e-5)
 
         x = conv(self.num_filters, (7, 7), (2, 2), padding=[(3, 3), (3, 3)], name="conv_init")(x)
         x = norm(name="bn_init")(x)
@@ -101,8 +100,7 @@ class ResNet(nn.Module):
                 x = self.block_cls(self.num_filters * 2 ** i, strides=strides, conv=conv, norm=norm, act=self.act)(x)
 
         x = jnp.mean(x, axis=(1, 2))
-        x = nn.Dense(self.num_classes, dtype=self.dtype)(x)
-        x = jnp.asarray(x, self.dtype)
+        x = nn.Dense(self.num_classes)(x)
         return x
 
 

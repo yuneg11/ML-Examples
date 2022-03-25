@@ -98,6 +98,8 @@ def get_train_loader(dataset: str, batch_size: int):
         ])
         CIFAR = CIFAR10 if dataset == "cifar10" else CIFAR100
         train_dataset = CIFAR(root="~/datasets", train=True, download=False, transform=train_transform)
+        num_workers = 4
+
     elif dataset == "imagenet":
         train_transform = transforms.Compose([
             transforms.RandomResizedCrop(224),
@@ -107,9 +109,15 @@ def get_train_loader(dataset: str, batch_size: int):
             lambda x: x.permute(1, 2, 0).numpy(),
         ])
         train_dataset = ImageNet(root="~/datasets/ILSVRC2012", split="train", transform=train_transform)
+        num_workers = 32
+
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
-    train_loader = DataLoader(train_dataset, batch_size, shuffle=True, num_workers=4, collate_fn=numpy_collate)
+
+    train_loader = DataLoader(
+        train_dataset, batch_size, shuffle=True,
+        num_workers=num_workers, collate_fn=numpy_collate,
+    )
     return train_loader
 
 
@@ -122,6 +130,8 @@ def get_valid_loader(dataset: str, batch_size: int):
         ])
         CIFAR = CIFAR10 if dataset == "cifar10" else CIFAR100
         valid_dataset = CIFAR(root="~/datasets", train=False, download=False, transform=valid_transform)
+        num_workers = 4
+
     elif dataset == "imagenet":
         valid_transform = transforms.Compose([
             transforms.Resize(256),
@@ -131,9 +141,15 @@ def get_valid_loader(dataset: str, batch_size: int):
             lambda x: x.permute(1, 2, 0).numpy(),
         ])
         valid_dataset = ImageNet(root="~/datasets/ILSVRC2012", split="val", transform=valid_transform)
+        num_workers = 32
+
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
-    valid_loader = DataLoader(valid_dataset, batch_size, shuffle=False, num_workers=4, collate_fn=numpy_collate)
+
+    valid_loader = DataLoader(
+        valid_dataset, batch_size, shuffle=False,
+        num_workers=num_workers, collate_fn=numpy_collate,
+    )
     return valid_loader
 
 

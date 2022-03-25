@@ -5,13 +5,14 @@ class CNN(nn.Module):
     num_classes: int
 
     @nn.compact
-    def __call__(self, x, **kwargs):
+    def __call__(self, x, train: bool = True):
         x = nn.Conv(features=32, kernel_size=(3, 3))(x)
-        x = nn.dropout(x, 0.2)
         x = nn.relu(x)
+        x = nn.Dropout(rate=0.1, deterministic=not train)(x)
         x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
         x = nn.Conv(features=64, kernel_size=(3, 3))(x)
         x = nn.relu(x)
+        x = nn.Dropout(rate=0.1, deterministic=not train)(x)
         x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
         x = x.reshape((x.shape[0], -1))
         x = nn.Dense(features=256)(x)
