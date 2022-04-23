@@ -31,7 +31,7 @@ from models.cnn import CNN
 from models.resnet import ResNet18, ResNet34, ResNet50, ResNet101, ResNet152, ResNet200
 
 
-def get_train_loader(dataset: str, batch_size: int):
+def get_train_loader(dataset: str, batch_size: int, prefetch: int, num_shards: int):
     if dataset == "cifar10" or dataset == "cifar100":
         train_transform = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
@@ -69,14 +69,14 @@ def get_train_loader(dataset: str, batch_size: int):
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
-    train_loader = DataLoader(
+    train_loader = TorchDataLoaderWrapper(DataLoader(
         train_dataset, batch_size, shuffle=True, drop_last=True,
         num_workers=num_workers, collate_fn=numpy_collate,
-    )
+    ), prefetch=prefetch, num_shards=num_shards)
     return train_loader
 
 
-def get_valid_loader(dataset: str, batch_size: int):
+def get_valid_loader(dataset: str, batch_size: int, prefetch: int, num_shards: int):
     if dataset == "cifar10" or dataset == "cifar100":
         valid_transform = transforms.Compose([
             transforms.ToTensor(),
@@ -110,10 +110,10 @@ def get_valid_loader(dataset: str, batch_size: int):
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
-    valid_loader = DataLoader(
+    valid_loader = TorchDataLoaderWrapper(DataLoader(
         valid_dataset, batch_size, shuffle=False, #drop_last=True,
         num_workers=num_workers, collate_fn=numpy_collate,
-    )
+    ), prefetch=prefetch, num_shards=num_shards)
     return valid_loader
 
 
@@ -189,13 +189,34 @@ def numpy_collate(batch):
         return np.array(batch)
 
 
-def shard_batch(*arrs, n):
-    new_arrs = []
-    for arr in arrs:
-        if arr.shape[0] % n != 0:
-            raise ValueError(f"Batch size ({arr.shape[0]}) must be divisible by number of shards ({n})")
-        new_arrs.append(np.reshape(arr, (n, arr.shape[0] // n, *arr.shape[1:])))
-    return new_arrs
+class TorchDataLoaderWrapper:
+    def __init__(self, dataloader, prefetch: int = 2, num_shards: int = -1):
+        self.dataloader = dataloader
+        self.prefetch = prefetch
+        self.num_shards = jax.local_device_count() if num_shards == -1 else num_shards
+
+    def _shard_batch(self, d):
+        batch_size = d.shape[0]
+        if batch_size % self.num_shards != 0:
+            raise ValueError(
+                f"Batch size ({batch_size}) must be divisible by number of shards ({self.num_shards})"
+            )
+        return jnp.reshape(d, (self.num_shards, batch_size // self.num_shards, *d.shape[1:]))
+
+    def _shard_iterator(self, iterator):
+        for batch in iterator:
+            yield jax.tree_util.tree_map(self._shard_batch, batch)
+
+    def __len__(self):
+        return len(self.dataloader)
+
+    def __iter__(self):
+        iterator = iter(self.dataloader)
+        if self.num_shards is not None:
+            iterator = self._shard_iterator(iterator)
+        if self.prefetch is not None:
+            iterator = jax_utils.prefetch_to_device(iterator, self.prefetch)
+        return iterator
 
 
 def main(args, output_dir):
@@ -237,10 +258,10 @@ def main(args, output_dir):
     w = model.init(rngs, dummy_input)
 
     # Initialize model and optimizer
-    if args.optimizer == "adam":
-        tx = optax.adam(learning_rate=args.learning_rate)
-    elif args.optimizer == "sgd":
+    if args.optimizer == "sgd":
         tx = optax.sgd(learning_rate=args.learning_rate)
+    elif args.optimizer == "adam":
+        tx = optax.adam(learning_rate=args.learning_rate)
     else:
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
 
@@ -256,7 +277,7 @@ def main(args, output_dir):
         state = TrainState.create(apply_fn=model.apply, tx=tx, params=w["params"])
 
     state = jax_utils.replicate(state)
-    num_devices = len(jax.local_devices())
+    num_devices = jax.local_device_count()
 
     # Setup output directory
     utils.link_output_dir(output_dir, subnames=(args.dataset, args.model))
@@ -265,8 +286,8 @@ def main(args, output_dir):
     train_step = get_train_step(use_batch_stats=use_batch_stats)
     valid_step = get_valid_step(use_batch_stats=use_batch_stats)
 
-    train_loader = get_train_loader(args.dataset, args.batch_size)
-    valid_loader = get_valid_loader(args.dataset, args.batch_size)
+    train_loader = get_train_loader(args.dataset, args.batch_size, prefetch=5, num_shards=num_devices)
+    valid_loader = get_valid_loader(args.dataset, args.batch_size, prefetch=5, num_shards=num_devices)
 
     train_meter = utils.AverageMeter("loss", "accuracy")
     valid_meter = utils.AverageMeter("loss", "accuracy")
@@ -279,7 +300,6 @@ def main(args, output_dir):
             for j, (images, labels) in enumerate(p.track(train_loader, description="Train", remove=True)):
                 key, model_key = random.split(key)
                 rngs = jax_utils.replicate(dict(dropout=model_key))
-                images, labels = shard_batch(images, labels, n=num_devices)
                 state, train_metric = train_step(state, rngs, images=images, labels=labels)
                 train_meter.update(train_metric, n=len(images))
 
@@ -290,7 +310,6 @@ def main(args, output_dir):
             for j, (images, labels) in enumerate(p.track(valid_loader, description="Valid", remove=True)):
                 key, model_key = random.split(key)
                 rngs = jax_utils.replicate(dict(dropout=model_key))
-                images, labels = shard_batch(images, labels, n=num_devices)
                 valid_metric = valid_step(state, rngs, images=images, labels=labels)
                 valid_meter.update(valid_metric, n=len(images))
 
@@ -303,9 +322,6 @@ def main(args, output_dir):
             if i % args.save_every == 0 and jax.process_index() == 0:
                 _state = jax_utils.unreplicate(state)
                 checkpoints.save_checkpoint(output_dir, _state, i, keep=3)
-
-    # Wait until computations are done before exiting
-    jax.random.normal(jax.random.PRNGKey(0), ()).block_until_ready()
 
     logger.info("Finished")
 
