@@ -25,6 +25,16 @@ from flax import linen as nn
 ModuleDef = Any
 
 
+__all__ = [
+    "ResNet18",
+    "ResNet34",
+    "ResNet50",
+    "ResNet101",
+    "ResNet152",
+    "ResNet200",
+]
+
+
 class ResNetBlock(nn.Module):
     filters: int
     conv: ModuleDef

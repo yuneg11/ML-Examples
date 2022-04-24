@@ -5,8 +5,6 @@ import os
 import logging
 from functools import partial
 
-import numpy as np
-
 import jax
 from jax import lax
 from jax import random
@@ -18,103 +16,17 @@ from flax.training import checkpoints, train_state
 
 import optax
 
+import numpy as np
 import torch
-from torchvision import transforms
-from torchvision.datasets import CIFAR10, CIFAR100, SVHN, ImageNet
-from torch.utils.data import DataLoader
+import random as pyrandom
 
 from nxml.jax.nn import functional as F
-from nxcl.experimental import utils
+from nxcl.config import load_config, save_config, add_config_arguments, ConfigDict
 from nxcl.rich import Progress
+from nxcl.experimental import utils
 
-from models.cnn import CNN
-from models.resnet import ResNet18, ResNet34, ResNet50, ResNet101, ResNet152, ResNet200
-
-
-def get_train_loader(dataset: str, batch_size: int, prefetch: int, num_shards: int):
-    if dataset == "cifar10" or dataset == "cifar100":
-        train_transform = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.491, 0.482, 0.446), (0.202, 0.199, 0.201)),
-            lambda x: x.permute(1, 2, 0).numpy(),
-        ])
-        CIFAR = CIFAR10 if dataset == "cifar10" else CIFAR100
-        train_dataset = CIFAR(root="~/datasets", train=True, download=False, transform=train_transform)
-        num_workers = 4
-
-    elif dataset == "svhn":
-        train_transform = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.431, 0.430, 0.446), (0.196, 0.198, 0.199)),
-            lambda x: x.permute(1, 2, 0).numpy(),
-        ])
-        train_dataset = SVHN(root="~/datasets", split="train", download=False, transform=train_transform)
-        num_workers = 4
-
-    elif dataset == "imagenet":
-        train_transform = transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-            lambda x: x.permute(1, 2, 0).numpy(),
-        ])
-        train_dataset = ImageNet(root="~/datasets/ILSVRC2012", split="train", transform=train_transform)
-        num_workers = 32
-
-    else:
-        raise ValueError(f"Unknown dataset: {dataset}")
-
-    train_loader = TorchDataLoaderWrapper(DataLoader(
-        train_dataset, batch_size, shuffle=True, drop_last=True,
-        num_workers=num_workers, collate_fn=numpy_collate,
-    ), prefetch=prefetch, num_shards=num_shards)
-    return train_loader
-
-
-def get_valid_loader(dataset: str, batch_size: int, prefetch: int, num_shards: int):
-    if dataset == "cifar10" or dataset == "cifar100":
-        valid_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.491, 0.482, 0.446), (0.202, 0.199, 0.201)),
-            lambda x: x.permute(1, 2, 0).numpy(),
-        ])
-        CIFAR = CIFAR10 if dataset == "cifar10" else CIFAR100
-        valid_dataset = CIFAR(root="~/datasets", train=False, download=False, transform=valid_transform)
-        num_workers = 4
-
-    elif dataset == "svhn":
-        valid_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.431, 0.430, 0.446), (0.196, 0.198, 0.199)),
-            lambda x: x.permute(1, 2, 0).numpy(),
-        ])
-        valid_dataset = SVHN(root="~/datasets", split="test", download=False, transform=valid_transform)
-        num_workers = 4
-
-    elif dataset == "imagenet":
-        valid_transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-            lambda x: x.permute(1, 2, 0).numpy(),
-        ])
-        valid_dataset = ImageNet(root="~/datasets/ILSVRC2012", split="val", transform=valid_transform)
-        num_workers = 32
-
-    else:
-        raise ValueError(f"Unknown dataset: {dataset}")
-
-    valid_loader = TorchDataLoaderWrapper(DataLoader(
-        valid_dataset, batch_size, shuffle=False, #drop_last=True,
-        num_workers=num_workers, collate_fn=numpy_collate,
-    ), prefetch=prefetch, num_shards=num_shards)
-    return valid_loader
+from lib.data import get_dataset_spec, get_train_loader, get_valid_loader
+from lib.models import CNN, ResNet18, ResNet34, ResNet50, ResNet101, ResNet152, ResNet200
 
 
 @jax.jit
@@ -122,13 +34,13 @@ def sync_metric(metric):
     return jax.tree_util.tree_map(lambda x: jnp.mean(x), metric)
 
 
-@partial(jax.pmap, axis_name="x")
-def cross_replica_mean(state):
-    return lax.pmean(state, axis_name="x")
+@partial(jax.pmap, axis_name="replica")
+def sync_replica_mean(state):
+    return lax.pmean(state, axis_name="replica")
 
 
 def sync_batch_stats(state):
-    state = state.replace(batch_stats=cross_replica_mean(state.batch_stats))
+    state = state.replace(batch_stats=sync_replica_mean(state.batch_stats))
     return state
 
 
@@ -136,12 +48,21 @@ def get_train_step(use_batch_stats=False):
     @partial(jax.pmap, axis_name="batch")
     def _train_step(state, rngs, *, images, labels):
         def loss_fn(params):
-            var = dict(params=params, batch_stats=state.batch_stats) if use_batch_stats else dict(params=params)
-            outputs = state.apply_fn(var, images, rngs=rngs, train=True, mutable=(["batch_stats"] if use_batch_stats else False))
+            if use_batch_stats:
+                var = dict(params=params, batch_stats=state.batch_stats)
+            else:
+                var = dict(params=params)
+
+            outputs = state.apply_fn(
+                var, images, rngs=rngs, train=True,
+                mutable=(["batch_stats"] if use_batch_stats else False),
+            )
+
             if use_batch_stats:
                 logits, new_state = outputs
             else:
                 logits = outputs
+
             loss = F.cross_entropy(input=logits, target=labels)
             accuracy = F.accuracy(input=logits, target=labels)
             return loss, (accuracy, (new_state if use_batch_stats else None))
@@ -166,7 +87,11 @@ def get_train_step(use_batch_stats=False):
 def get_valid_step(use_batch_stats=False):
     @partial(jax.pmap, axis_name="batch")
     def _valid_step(state, rngs, *, images, labels):
-        var = dict(params=state.params, batch_stats=state.batch_stats) if use_batch_stats else dict(params=state.params)
+        if use_batch_stats:
+            var = dict(params=state.params, batch_stats=state.batch_stats)
+        else:
+            var = dict(params=state.params)
+
         logits = state.apply_fn(var, images, rngs=rngs, train=False, mutable=False)
         loss = F.cross_entropy(input=logits, target=labels)
         accuracy = F.accuracy(input=logits, target=labels)
@@ -179,66 +104,20 @@ def get_valid_step(use_batch_stats=False):
     return valid_step
 
 
-def numpy_collate(batch):
-    if isinstance(batch[0], np.ndarray):
-        return np.stack(batch)
-    elif isinstance(batch[0], (tuple, list)):
-        transposed = zip(*batch)
-        return [numpy_collate(samples) for samples in transposed]
-    else:
-        return np.array(batch)
+def main(config, output_dir):
+    num_devices = jax.local_device_count()
 
-
-class TorchDataLoaderWrapper:
-    def __init__(self, dataloader, prefetch: int = 2, num_shards: int = -1):
-        self.dataloader = dataloader
-        self.prefetch = prefetch
-        self.num_shards = jax.local_device_count() if num_shards == -1 else num_shards
-
-    def _shard_batch(self, d):
-        batch_size = d.shape[0]
-        if batch_size % self.num_shards != 0:
-            raise ValueError(
-                f"Batch size ({batch_size}) must be divisible by number of shards ({self.num_shards})"
-            )
-        return jnp.reshape(d, (self.num_shards, batch_size // self.num_shards, *d.shape[1:]))
-
-    def _shard_iterator(self, iterator):
-        for batch in iterator:
-            yield jax.tree_util.tree_map(self._shard_batch, batch)
-
-    def __len__(self):
-        return len(self.dataloader)
-
-    def __iter__(self):
-        iterator = iter(self.dataloader)
-        if self.num_shards is not None:
-            iterator = self._shard_iterator(iterator)
-        if self.prefetch is not None:
-            iterator = jax_utils.prefetch_to_device(iterator, self.prefetch)
-        return iterator
-
-
-def main(args, output_dir):
+    # Logging
     logger = logging.getLogger(__name__)
 
-    key = random.PRNGKey(args.seed)
-    rngs = dict(params=key, dropout=key)
+    # Random seed
+    np.random.seed(config.train.seed)
+    torch.manual_seed(config.train.seed)
+    pyrandom.seed(config.train.seed)
+    os.environ["PYTHONHASHSEED"] = str(config.train.seed)
 
-    if args.dataset == "cifar10":
-        dummy_input = jnp.ones((4, 32, 32, 3))
-        num_classes = 10
-    elif args.dataset == "cifar100":
-        dummy_input = jnp.ones((4, 32, 32, 3))
-        num_classes = 100
-    elif args.dataset == "svhn":
-        dummy_input = jnp.ones((4, 32, 32, 3))
-        num_classes = 10
-    elif args.dataset == "imagenet":
-        dummy_input = jnp.ones((4, 224, 224, 3))
-        num_classes = 1000
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset}")
+    key = random.PRNGKey(config.train.seed)
+    rngs = dict(params=key, dropout=key)
 
     # Create model
     models = {
@@ -251,25 +130,29 @@ def main(args, output_dir):
         "resnet200": ResNet200,
     }
 
-    if args.model not in models:
-        raise ValueError(f"Unknown model: {args.model}")
+    if config.model.name not in models:
+        raise ValueError(f"Unknown model: {config.model.name}")
 
-    model = models[args.model](num_classes=num_classes)
-    w = model.init(rngs, dummy_input)
+    spec = get_dataset_spec(config.dataset.name)
+
+    model = models[config.model.name](num_classes=spec.num_classes)
+    w = model.init(rngs, jnp.zeros((num_devices, *spec.image_shape)))
 
     # Initialize model and optimizer
-    if args.optimizer == "sgd":
-        tx = optax.sgd(learning_rate=args.learning_rate)
-    elif args.optimizer == "adam":
-        tx = optax.adam(learning_rate=args.learning_rate)
+    if config.optimizer.name == "sgd":
+        tx = optax.sgd(learning_rate=config.optimizer.learning_rate)
+    elif config.optimizer.name == "adam":
+        tx = optax.adam(learning_rate=config.optimizer.learning_rate)
     else:
-        raise ValueError(f"Unknown optimizer: {args.optimizer}")
+        raise ValueError(f"Unknown optimizer: {config.optimizer.name}")
 
     if "batch_stats" in w:
         use_batch_stats = True
         class TrainState(train_state.TrainState):
             batch_stats: jnp.DeviceArray = None
-        state = TrainState.create(apply_fn=model.apply, tx=tx, params=w["params"], batch_stats=w["batch_stats"])
+        state = TrainState.create(
+            apply_fn=model.apply, tx=tx, params=w["params"], batch_stats=w["batch_stats"],
+        )
     else:
         use_batch_stats = False
         class TrainState(train_state.TrainState):
@@ -277,26 +160,33 @@ def main(args, output_dir):
         state = TrainState.create(apply_fn=model.apply, tx=tx, params=w["params"])
 
     state = jax_utils.replicate(state)
-    num_devices = jax.local_device_count()
 
     # Setup output directory
-    utils.link_output_dir(output_dir, subnames=(args.dataset, args.model))
+    utils.link_output_dir(output_dir, subnames=(config.dataset.name, config.model.name))
 
     # Setup steps
     train_step = get_train_step(use_batch_stats=use_batch_stats)
     valid_step = get_valid_step(use_batch_stats=use_batch_stats)
 
-    train_loader = get_train_loader(args.dataset, args.batch_size, prefetch=5, num_shards=num_devices)
-    valid_loader = get_valid_loader(args.dataset, args.batch_size, prefetch=5, num_shards=num_devices)
+    train_loader = get_train_loader(
+        config.dataset.name, batch_size=config.dataset.batch_size,
+        prefetch=config.dataset.prefetch, num_shards=num_devices,
+    )
+    valid_loader = get_valid_loader(
+        config.dataset.name, batch_size=config.dataset.batch_size,
+        prefetch=config.dataset.prefetch, num_shards=num_devices,
+    )
 
     train_meter = utils.AverageMeter("loss", "accuracy")
     valid_meter = utils.AverageMeter("loss", "accuracy")
 
     # Train
     with Progress() as p:
-        for i in p.trange(1, args.num_epochs + 1, description="Epoch"):
+        logger.info("Start training")
 
+        for i in p.trange(1, config.train.num_epochs + 1, description="Epoch"):
             train_meter.reset()
+
             for j, (images, labels) in enumerate(p.track(train_loader, description="Train", remove=True)):
                 key, model_key = random.split(key)
                 rngs = jax_utils.replicate(dict(dropout=model_key))
@@ -306,57 +196,82 @@ def main(args, output_dir):
             if use_batch_stats:
                 state = sync_batch_stats(state)
 
-            valid_meter.reset()
-            for j, (images, labels) in enumerate(p.track(valid_loader, description="Valid", remove=True)):
-                key, model_key = random.split(key)
-                rngs = jax_utils.replicate(dict(dropout=model_key))
-                valid_metric = valid_step(state, rngs, images=images, labels=labels)
-                valid_meter.update(valid_metric, n=len(images))
+            if i % config.train.print_every == 0:
+                logger.info(
+                    f"Epoch {i:3d} / {config.train.num_epochs} | "
+                    f"Train Loss: {train_meter.loss:7.4f}  Acc: {train_meter.accuracy * 100:6.2f}"
+                )
 
-            logger.info(
-                f"Epoch {i:3d} / {args.num_epochs} | "
-                f"Train Loss: {train_meter.loss:7.4f}  Acc: {train_meter.accuracy * 100:6.2f} | "
-                f"Valid Loss: {valid_meter.loss:7.4f}  Acc: {valid_meter.accuracy * 100:6.2f}"
-            )
+            if i % config.train.valid_every == 0:
+                valid_meter.reset()
 
-            if i % args.save_every == 0 and jax.process_index() == 0:
-                _state = jax_utils.unreplicate(state)
-                checkpoints.save_checkpoint(output_dir, _state, i, keep=3)
+                for j, (images, labels) in enumerate(p.track(valid_loader, description="Valid", remove=True)):
+                    key, model_key = random.split(key)
+                    rngs = jax_utils.replicate(dict(dropout=model_key))
+                    valid_metric = valid_step(state, rngs, images=images, labels=labels)
+                    valid_meter.update(valid_metric, n=len(images))
+
+                if i % config.train.print_every == 0:
+                    logger.info(
+                        f"                | "
+                        f"Valid Loss: {valid_meter.loss:7.4f}  Acc: {valid_meter.accuracy * 100:6.2f}"
+                    )
+
+            if i % config.train.save_every == 0 and jax.process_index() == 0:
+                checkpoints.save_checkpoint(
+                    output_dir, jax_utils.unreplicate(state),
+                    step=i, prefix="checkpoint_", keep=1,
+                )
 
     logger.info("Finished")
 
 
 if __name__ == "__main__":
-    from argparse import ArgumentParser
+    import argparse
 
-    parser = ArgumentParser()
-    parser.add_argument("-m",   "--model",         type=str,   default="cnn")
-    parser.add_argument("-d",   "--dataset",       type=str,   default="cifar10")
-    parser.add_argument("-opt", "--optimizer",     type=str,   default="sgd")
-    parser.add_argument("-e",   "--num-epochs",    type=int,   default=100)
-    parser.add_argument("-bs",  "--batch-size",    type=int,   default=512)
-    parser.add_argument("-lr",  "--learning-rate", type=float, default=0.1)
-    parser.add_argument("-s",   "--seed",          type=int,   default=0)
-    parser.add_argument("--valid-every",           type=int,   default=100)
-    parser.add_argument("--save-every",            type=int,   default=10)
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(add_help=False, conflict_handler="resolve")
+    parser.add_argument("-f", "--config-file", type=str, required=True)
+    args, rest_args = parser.parse_known_args()
+
+    config: ConfigDict = load_config(args.config_file).lock()
+    add_config_arguments(parser, config, aliases={
+        "train.seed":              ["-s",   "--seed"],
+        "train.num_epochs":        ["-e",   "--epochs"],
+        "dataset.name":            ["-d",   "--dataset"],
+        "dataset.batch_size":      ["-bs",  "--batch-size"],
+        "model.name":              ["-m",   "--model"],
+        "optimizer.name":          ["-opt", "--optimizer"],
+        "optimizer.learning_rate": ["-lr",  "--learning-rate"],
+    })
+    parser.add_argument("-f", "--config-file", default=argparse.SUPPRESS)
+    parser.add_argument("-h", "--help", action="help", default=argparse.SUPPRESS)
+    args = parser.parse_args(rest_args)
+
+    config.update(vars(args))
 
     # Logger
     log_name = utils.get_experiment_name()
-
     output_dir = os.path.join("outs", "_", log_name)
-    os.makedirs(output_dir, exist_ok=True)
+    latest_link = os.path.join("outs", "_", "_latest")
 
-    logger = utils.setup_logger(__name__, output_dir, suppress=[jax, flax, torch])
+    os.makedirs(output_dir, exist_ok=True)
+    if os.path.exists(latest_link):
+        os.remove(latest_link)
+    os.symlink(log_name, latest_link)
+    save_config(config, os.path.join(output_dir, "config.yaml"))
+
+    logger = utils.setup_logger(__name__, output_dir, suppress=[jax, flax])
     logger.debug("python " + " ".join(sys.argv))
 
-    args_str = "\n  Arguments:"
-    for k, v in vars(args).items():
-        args_str += f"\n    {k:<15}: {v}"
-    logger.info(args_str + "\n")
+    args_str = "Configs:"
+    for k, v in config.items(flatten=True):
+        args_str += f"\n    {k:<25}: {v}"
+    logger.info(args_str)
+
+    logger.info(f"Output directory: \"{output_dir}\"")
 
     try:
-        main(args, output_dir)
+        main(config, output_dir)
     except KeyboardInterrupt:
         logger.info("Interrupted")
     except Exception as e:

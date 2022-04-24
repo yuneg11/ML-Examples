@@ -1,0 +1,18 @@
+train:
+  seed: 0
+  num_epochs: 100
+  print_every: 1
+  valid_every: 2
+  save_every: 5
+
+dataset:
+  name: cifar10
+  batch_size: 512
+  prefetch: 5
+
+model:
+  name: cnn
+
+optimizer:
+  name: sgd
+  learning_rate: 0.05

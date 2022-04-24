@@ -1,6 +1,11 @@
 from flax import linen as nn
 
 
+__all__ = [
+    "CNN",
+]
+
+
 class CNN(nn.Module):
     num_classes: int
 
